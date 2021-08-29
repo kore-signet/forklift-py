@@ -1,14 +1,11 @@
 import asyncio
 import httpx
-import time
-import gzip
 import janus
 import itertools
 import io
-import datetime
-import time
 import progressbar
 import argparse
+import traceback
 from warcio.warcwriter import WARCWriter
 from warcio.statusandheaders import StatusAndHeaders
 
@@ -43,17 +40,26 @@ def threaded_writer(sync_q, outpath):
             sync_q.task_done()
 
 async def get(client, url, queue):
-    async with client.stream("GET", url) as res:
-        b = bytearray()
-        async for chunk in res.aiter_raw():
-            b += chunk
-        await queue.put((url, res.status_code, res.reason_phrase, dict(res.headers).items(), b))
+    try:
+        async with client.stream("GET", url) as res:
+            b = bytearray()
+            async for chunk in res.aiter_raw():
+                b += chunk
+            await queue.put((url, res.status_code, res.reason_phrase, dict(res.headers).items(), b))
+    except KeyboardInterrupt:
+        return (False, url)
+    except:
+        return (True, traceback.format_exc(), url)
+
+    return (False, url)
 
 async def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("input", help="file with line-separated urls")
     parser.add_argument("output", help="warc file to write to")
+    parser.add_argument("err_file", help="file to write urls that errored to")
     parser.add_argument("-s", "--chunk-size", help="how many requests to send out concurrently", type=int, default=50)
+    parser.add_argument("-t", "--time-out", help="http timeout (seconds)", type=int, default=5)
     parser.add_argument("--no-cert-verify", help="don't verify certificates", action="store_true")
     args = parser.parse_args()
 
@@ -66,22 +72,28 @@ async def main():
 
     bar = progressbar.ProgressBar(max_value=len(lines))
 
-    async with httpx.AsyncClient(http2=True,timeout=100000000000000,verify=not args.no_cert_verify) as client:
-        i = 1
-        for chunk in grouper_it(args.chunk_size,lines):
-            chunk_start = time.monotonic()
-            for c in asyncio.as_completed([get(client, l, queue.async_q) for l in chunk]):
-                await c
-                bar.update(i)
-                i += 1
+    with open(args.err_file, "w") as errf:
+        async with httpx.AsyncClient(http2=True,timeout=args.time_out,verify=not args.no_cert_verify) as client:
+            i = 1
+            for chunk in grouper_it(args.chunk_size,lines):
+                for c in asyncio.as_completed([get(client, l, queue.async_q) for l in chunk]):
+                    r = await c
+                    if r[0]:
+                        errf.write(r[2])
+                        errf.write("\n|EXCEPTION|\n")
+                        errf.write(r[1])
+                        errf.write("|EXCEPTION_END|\n")
 
-    await queue.async_q.put(True)
+                    bar.update(i)
+                    i += 1
 
-    await fut
+        await queue.async_q.put(True)
 
-    await queue.async_q.join()
+        await fut
 
-    queue.close()
-    await queue.wait_closed()
+        await queue.async_q.join()
+
+        queue.close()
+        await queue.wait_closed()
 
 asyncio.run(main())
