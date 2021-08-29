@@ -6,8 +6,10 @@ import io
 import progressbar
 import argparse
 import traceback
+import time
 from warcio.warcwriter import WARCWriter
 from warcio.statusandheaders import StatusAndHeaders
+
 
 def grouper_it(n, iterable):
     it = iter(iterable)
@@ -19,9 +21,10 @@ def grouper_it(n, iterable):
             return
         yield itertools.chain((first_el,), chunk_it)
 
+
 def threaded_writer(sync_q, outpath):
-    with open(outpath,'wb') as output:
-        writer = WARCWriter(output,gzip=True)
+    with open(outpath, "wb") as output:
+        writer = WARCWriter(output, gzip=True)
         while True:
             res = sync_q.get()
             if res == True:
@@ -30,14 +33,17 @@ def threaded_writer(sync_q, outpath):
 
             record = writer.create_warc_record(
                 res[0],
-                'response',
-                http_headers=StatusAndHeaders(f"{res[1]} {res[2]}", res[3], protocol='HTTP/1.1'),
-                payload=io.BytesIO(res[4])
+                "response",
+                http_headers=StatusAndHeaders(
+                    f"{res[1]} {res[2]}", res[3], protocol="HTTP/1.1"
+                ),
+                payload=io.BytesIO(res[4]),
             )
 
             writer.write_record(record)
 
             sync_q.task_done()
+
 
 async def get(client, url, queue):
     try:
@@ -45,7 +51,9 @@ async def get(client, url, queue):
             b = bytearray()
             async for chunk in res.aiter_raw():
                 b += chunk
-            await queue.put((url, res.status_code, res.reason_phrase, dict(res.headers).items(), b))
+            await queue.put(
+                (url, res.status_code, res.reason_phrase, dict(res.headers).items(), b)
+            )
     except KeyboardInterrupt:
         return (False, url)
     except:
@@ -53,14 +61,29 @@ async def get(client, url, queue):
 
     return (False, url)
 
+
 async def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("input", help="file with line-separated urls")
     parser.add_argument("output", help="warc file to write to")
     parser.add_argument("err_file", help="file to write urls that errored to")
-    parser.add_argument("-s", "--chunk-size", help="how many requests to send out concurrently", type=int, default=50)
-    parser.add_argument("-t", "--time-out", help="http timeout (seconds)", type=int, default=5)
-    parser.add_argument("--no-cert-verify", help="don't verify certificates", action="store_true")
+    parser.add_argument(
+        "-s",
+        "--chunk-size",
+        help="how many requests to send out concurrently",
+        type=int,
+        default=50,
+    )
+    parser.add_argument(
+        "-t", "--time-out", help="http timeout (seconds)", type=int, default=5
+    )
+    parser.add_argument(
+        "-u", "--user-agent", help="user agent", type=str, default="forklift/0.0.1"
+    )
+    parser.add_argument(
+        "--no-cert-verify", help="don't verify certificates", action="store_true"
+    )
+    parser.add_argument("--interval", help="interval to wait between chunks", type=int)
     args = parser.parse_args()
 
     queue = janus.Queue()
@@ -73,10 +96,17 @@ async def main():
     bar = progressbar.ProgressBar(max_value=len(lines))
 
     with open(args.err_file, "w") as errf:
-        async with httpx.AsyncClient(http2=True,timeout=args.time_out,verify=not args.no_cert_verify) as client:
+        async with httpx.AsyncClient(
+            http2=True,
+            timeout=args.time_out,
+            headers={"User-Agent": args.user_agent},
+            verify=not args.no_cert_verify,
+        ) as client:
             i = 1
-            for chunk in grouper_it(args.chunk_size,lines):
-                for c in asyncio.as_completed([get(client, l, queue.async_q) for l in chunk]):
+            for chunk in grouper_it(args.chunk_size, lines):
+                for c in asyncio.as_completed(
+                    [get(client, l, queue.async_q) for l in chunk]
+                ):
                     r = await c
                     if r[0]:
                         errf.write(r[2])
@@ -87,6 +117,9 @@ async def main():
                     bar.update(i)
                     i += 1
 
+                if args.interval:
+                    time.sleep(args.interval)
+
         await queue.async_q.put(True)
 
         await fut
@@ -95,5 +128,6 @@ async def main():
 
         queue.close()
         await queue.wait_closed()
+
 
 asyncio.run(main())
